@@ -25,7 +25,8 @@ def train_all_problems(
     device: torch.device,
     training_order: list = None,
     existing_models: dict = None,
-    use_transfer_learning: bool = True,
+    use_transfer_learning: bool = False,
+    # use_transfer_learning: bool = True,
     retrain_targets: list | set | None = None,
     progress: bool = False
 ):

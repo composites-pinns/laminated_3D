@@ -69,8 +69,10 @@ class PINN(nn.Module):
         # PDE parameters
         self.VF_mat1 = param['VF_mat1']
         self.VF_mat2 = param['VF_mat2']
-        self.R_mat1 = param['R_mat1']
-        self.R_mat2 = param['R_mat2']
+        # Ensure R matrices are tensors on the correct device/dtype to avoid numpy broadcasting issues
+        # during graph construction
+        self.R_mat1 = torch.tensor(param['R_mat1'], dtype=DTYPE).to(self.device)
+        self.R_mat2 = torch.tensor(param['R_mat2'], dtype=DTYPE).to(self.device)
 
         # NN
         self.layers = layers
@@ -251,7 +253,7 @@ class PINN(nn.Module):
         self.optimizer_Adam.zero_grad()
         loss_total, lc, lu, li = self.loss()
         loss_total.backward()
-        self.optimizer_Adam.step()
+        # self.optimizer_Adam.step() # OSCAR
         return loss_total, lc, lu, li
 
     def Log(self, loss_total, loss_collocation, loss_uniqueness_condition, loss_interface, pbar, it, log_every):

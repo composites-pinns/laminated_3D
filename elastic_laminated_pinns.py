@@ -370,7 +370,8 @@ def main():
                 PARAM, device,
                 training_order=order,
                 existing_models=existing_models.copy(),
-                use_transfer_learning=True,
+                use_transfer_learning=False,
+                # use_transfer_learning=True,
                 progress=False
             )
             trained_models[target] = models_all[target-1]
@@ -470,7 +471,8 @@ def main():
             PARAM, device,
             training_order=[6, 5],
             existing_models=trained_models.copy(),
-            use_transfer_learning=True,
+            use_transfer_learning=False,
+            # use_transfer_learning=True,
             progress=False
         )
         trained_models[5] = models[4]
@@ -495,7 +497,8 @@ def main():
             PARAM, device,
             training_order=[6, 5, 4],
             existing_models=trained_models.copy(),
-            use_transfer_learning=True,
+            use_transfer_learning=False,
+            # use_transfer_learning=True,
             progress=False
         )
         trained_models[4] = models[3]
@@ -520,7 +523,8 @@ def main():
             PARAM, device,
             training_order=[6, 4, 5, 3],
             existing_models=trained_models.copy(),
-            use_transfer_learning=True,
+            use_transfer_learning=False,
+            # use_transfer_learning=True,
             progress=False
         )
         trained_models[3] = models[2]
@@ -545,7 +549,8 @@ def main():
             PARAM, device,
             training_order=[6, 4, 5, 3, 2],
             existing_models=trained_models.copy(),
-            use_transfer_learning=True,
+            use_transfer_learning=False,
+            # use_transfer_learning=True,
             progress=False
         )
         trained_models[2] = models[1]
@@ -570,7 +575,8 @@ def main():
             PARAM, device,
             training_order=[6, 4, 5, 3, 2, 1],
             existing_models=trained_models.copy(),
-            use_transfer_learning=True,
+            use_transfer_learning=False,
+            # use_transfer_learning=True,
             progress=False
         )
         trained_models[1] = models[0]
