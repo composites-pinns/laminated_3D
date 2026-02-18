@@ -1,9 +1,5 @@
 import numpy as np
-from .config import TRAIN_SEED, y_I, N_COLLOCATION, N_UNIQUENESS, N_BOUNDARY, N_POINTS
-
-
-def set_seeds():
-    np.random.seed(TRAIN_SEED)
+from .config import TRAIN_SEED, y_I, N_COLLOCATION, N_UNIQUENESS, N_POINTS
 
 
 def build_train_data():

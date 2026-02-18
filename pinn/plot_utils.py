@@ -1,8 +1,4 @@
-"""Plotting utilities for PINN hypergrid: smoothing and save helpers.
-
-Provides EMA smoothing and helpers to save rel-error and loss-overlay plots
-to separate files so visualization logic is centralized.
-"""
+"""Plotting utilities: smoothing and save helpers."""
 
 from typing import List, Iterable
 import numpy as np
@@ -78,6 +74,95 @@ def plot_relerr(xs, ys, xlabel: str, title: str, out_path: str, logx: bool = Fal
     plt.close(fig)
 
 
+def plot_reff_evolution(epochs: List, reff_pred: List, reff_exact: float, p_run: int, 
+                        out_path: str, smooth_alpha: float | None = None, transitions: List[tuple] | None = None):
+    """Grafica la evolución de R_eff predicho vs epochs, con el valor exacto como línea horizontal.
+    
+    Args:
+        epochs: Lista de epochs
+        reff_pred: Lista de valores R_eff predichos
+        reff_exact: Valor exacto de R_eff (línea horizontal)
+        p_run: Índice del problema (1-6)
+        out_path: Ruta para guardar el gráfico
+        smooth_alpha: Factor de suavizado EMA (None = sin suavizar)
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        raise
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Filtrar valores NaN e infinitos
+    valid_mask = []
+    for v in reff_pred:
+        try:
+            fv = float(v)
+            valid_mask.append(not (np.isnan(fv) or np.isinf(fv)))
+        except:
+            valid_mask.append(False)
+    
+    epochs_clean = [e for e, m in zip(epochs, valid_mask) if m]
+    reff_clean = [float(v) for v, m in zip(reff_pred, valid_mask) if m]
+    
+    if not epochs_clean:
+        plt.close(fig)
+        return
+    
+    # R_eff predicho
+    if smooth_alpha is None:
+        ax.plot(epochs_clean, reff_clean, 'b-', linewidth=1.5, 
+                label=f'$R^*_{{{p_run}{p_run}}}$ predicho', alpha=0.8)
+    else:
+        reff_smooth = smooth_ema(reff_clean, smooth_alpha)
+        ax.plot(epochs_clean, reff_smooth, 'b-', linewidth=2.0, 
+                label=f'$R^*_{{{p_run}{p_run}}}$ predicho (smooth α={smooth_alpha})', alpha=0.9)
+    
+    # R_eff exacto (línea horizontal roja)
+    ax.axhline(y=reff_exact, color='r', linestyle='--', linewidth=2, 
+               label=f'$R^*_{{{p_run}{p_run}}}$ exacto = {reff_exact:.4f}')
+
+    # Dibujar líneas verticales en transiciones de fase si se proporcionan
+    if transitions:
+        drew_adam_lb = False
+        drew_lb_adam = False
+        for ep, kind in transitions:
+            try:
+                xval = float(ep)
+            except Exception:
+                continue
+            if kind == 'adam->lbfgs':
+                # amarillo
+                lab = 'Adam → L-BFGS' if not drew_adam_lb else None
+                ax.axvline(x=xval, color='gold', linestyle='--', linewidth=1.5, alpha=0.9, label=lab, zorder=0)
+                drew_adam_lb = True
+            elif kind == 'lbfgs->adam':
+                # verde
+                lab = 'L-BFGS → Adam' if not drew_lb_adam else None
+                ax.axvline(x=xval, color='limegreen', linestyle='--', linewidth=1.5, alpha=0.9, label=lab, zorder=0)
+                drew_lb_adam = True
+
+    
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel(f'$R^*_{{{p_run}{p_run}}}$', fontsize=12)
+    ax.set_title(f'Evolución de $R^*_{{{p_run}{p_run}}}$ durante el entrenamiento', fontsize=14)
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    # Añadir información del error relativo final
+    if reff_clean:
+        final_pred = reff_clean[-1]
+        if reff_exact != 0:
+            rel_err = abs(final_pred - reff_exact) / abs(reff_exact) * 100
+            ax.text(0.98, 0.02, f'Error relativo final: {rel_err:.2f}%', 
+                    transform=ax.transAxes, ha='right', va='bottom', fontsize=10,
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
 def plot_loss_overlays(loss_csv_paths: Iterable[str], labels: Iterable[str], out_path: str, smooth_alpha: float | None = None):
     """Plot multiple loss CSVs on the same axis.
 
@@ -144,6 +229,7 @@ def plot_loss_overlays(loss_csv_paths: Iterable[str], labels: Iterable[str], out
 
         # Mask extreme values (> MAX_VALID) for plotting only
         MAX_VALID = 1e3
+        MIN_VALID = 1e-12
         if smooth_alpha is None:
             plot_vals = losses
             label = f"v={lab}"
@@ -185,8 +271,11 @@ def plot_loss_overlays(loss_csv_paths: Iterable[str], labels: Iterable[str], out
 def plot_loss_components(loss_csv_path: str, out_path: str, smooth_alpha: float | None = None):
     """Plot loss components (collocation, uniqueness, interface, total) from a single CSV file.
 
-    CSV expected columns: epoch, loss_total (or loss), loss_collocation, loss_uniqueness (or
-    loss_uniqueness_condition), loss_interface. Falls back to plotting 'loss' only.
+    Si el CSV contiene columnas weighted_*, grafica las contribuciones ponderadas (w*L)
+    que suman correctamente al total. Si no, grafica las pérdidas crudas.
+
+    CSV expected columns: epoch, loss_total, weighted_collocation, weighted_uniqueness,
+    weighted_interface o loss_collocation, loss_uniqueness, loss_interface.
     """
     try:
         import matplotlib.pyplot as plt
@@ -203,6 +292,7 @@ def plot_loss_components(loss_csv_path: str, out_path: str, smooth_alpha: float 
     loss_coll = []
     loss_uniq = []
     loss_int = []
+    use_weighted = False  # Flag para saber si usamos contribuciones ponderadas
 
     if pd is not None:
         try:
@@ -213,13 +303,26 @@ def plot_loss_components(loss_csv_path: str, out_path: str, smooth_alpha: float 
                 loss_total = df['loss_total'].astype(float).tolist()
             elif 'loss' in df.columns:
                 loss_total = df['loss'].astype(float).tolist()
-            if 'loss_collocation' in df.columns:
+            
+            # Preferir contribuciones ponderadas si están disponibles
+            if 'weighted_collocation' in df.columns:
+                loss_coll = df['weighted_collocation'].astype(float).tolist()
+                use_weighted = True
+            elif 'loss_collocation' in df.columns:
                 loss_coll = df['loss_collocation'].astype(float).tolist()
-            if 'loss_uniqueness' in df.columns:
+                
+            if 'weighted_uniqueness' in df.columns:
+                loss_uniq = df['weighted_uniqueness'].astype(float).tolist()
+                use_weighted = True
+            elif 'loss_uniqueness' in df.columns:
                 loss_uniq = df['loss_uniqueness'].astype(float).tolist()
-            if 'loss_uniqueness_condition' in df.columns and not loss_uniq:
+            elif 'loss_uniqueness_condition' in df.columns:
                 loss_uniq = df['loss_uniqueness_condition'].astype(float).tolist()
-            if 'loss_interface' in df.columns:
+                
+            if 'weighted_interface' in df.columns:
+                loss_int = df['weighted_interface'].astype(float).tolist()
+                use_weighted = True
+            elif 'loss_interface' in df.columns:
                 loss_int = df['loss_interface'].astype(float).tolist()
         except Exception:
             pass
@@ -234,18 +337,28 @@ def plot_loss_components(loss_csv_path: str, out_path: str, smooth_alpha: float 
                 idx_lc = None
                 idx_lu = None
                 idx_li = None
+                # Buscar columnas weighted primero
                 for i, h in enumerate(headers):
                     if h == 'epoch':
                         idx_epoch = i
                     if h == 'loss_total' or h == 'loss':
                         idx_loss = i
-                    if h == 'loss_collocation':
+                    if h == 'weighted_collocation':
                         idx_lc = i
-                    if h == 'loss_uniqueness':
+                        use_weighted = True
+                    elif h == 'loss_collocation' and idx_lc is None:
+                        idx_lc = i
+                    if h == 'weighted_uniqueness':
                         idx_lu = i
-                    if h == 'loss_uniqueness_condition' and idx_lu is None:
+                        use_weighted = True
+                    elif h == 'loss_uniqueness' and idx_lu is None:
                         idx_lu = i
-                    if h == 'loss_interface':
+                    elif h == 'loss_uniqueness_condition' and idx_lu is None:
+                        idx_lu = i
+                    if h == 'weighted_interface':
+                        idx_li = i
+                        use_weighted = True
+                    elif h == 'loss_interface' and idx_li is None:
                         idx_li = i
                 for row in r:
                     if idx_epoch is not None:
@@ -279,7 +392,8 @@ def plot_loss_components(loss_csv_path: str, out_path: str, smooth_alpha: float 
     # Plot
     fig, ax = plt.subplots(figsize=(7, 4))
     plotted = False
-    MAX_VALID = 1e3
+    MAX_VALID = 1e6  # Aumentado para permitir valores más grandes
+    MIN_VALID = 1e-12
 
     # Helper to prepare array (apply smoothing if requested)
     def _prepare(vals):
@@ -340,7 +454,9 @@ def plot_loss_components(loss_csv_path: str, out_path: str, smooth_alpha: float 
     if any(v > 0 for v in y_vals):
         ax.set_yscale('log')
 
-    ax.set_title('Loss components')
+    # Título indica si son contribuciones ponderadas (suman al total) o pérdidas crudas
+    title = 'Loss components (weighted, sum=total)' if use_weighted else 'Loss components (raw, may not sum to total)'
+    ax.set_title(title)
     if plotted:
         ax.legend(loc='best')
     fig.tight_layout()

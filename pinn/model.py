@@ -5,9 +5,12 @@ import torch.nn as nn
 import time
 from .config import (
     DTYPE, NORMALIZE_INPUTS, ADAPTIVE_WEIGHTS, ADAPTIVE_BETA,
-    WEIGHT_MIN, WEIGHT_MAX, ADAM_LR, LOG_WEIGHTS
+    WEIGHT_MIN, WEIGHT_MAX, ADAM_LR,
+    ADAM_PRINT_EVERY, LBFGS_PRINT_EVERY,
+    LBFGS_LR, LBFGS_MAX_ITER, LBFGS_MAX_EVAL_MULT, LBFGS_HISTORY_SIZE,
+    LBFGS_LINE_SEARCH_FN, LBFGS_TOL_GRAD, LBFGS_TOL_CHANGE,
+    WEIGHT_UNIQUENESS_MIN,
 )
-from .checkpoint import get_next_version, checkpoint_path_for
 
 
 class FCN(nn.Module):
@@ -16,9 +19,10 @@ class FCN(nn.Module):
         self.device = device
         self.layers = layers
         self.activation = activation or nn.Tanh()
-        self.linear = nn.ModuleList([nn.Linear(self.layers[i], self.layers[i + 1]) for i in range(len(self.layers) - 1)])
-        # Inicialización determinista de pesos (xavier_normal usa la seed global de torch)
-        for i in range(len(self.layers) - 1):
+
+        self.linear = nn.ModuleList([nn.Linear(layers[i], layers[i + 1])
+                                      for i in range(len(layers) - 1)])
+        for i in range(len(layers) - 1):
             nn.init.xavier_normal_(self.linear[i].weight.data, gain=1.0)
             nn.init.zeros_(self.linear[i].bias.data)
 
@@ -26,10 +30,11 @@ class FCN(nn.Module):
         if not torch.is_tensor(X):
             X = torch.from_numpy(X)
         a = X.to(dtype=DTYPE)
-        # Optional input normalization to [-1, 1] for y in [0,1]
+
         if NORMALIZE_INPUTS:
             a = 2.0 * a - 1.0
-        for i in range(len(self.layers) - 2):
+
+        for i in range(len(self.linear) - 1):
             z = self.linear[i](a)
             a = self.activation(z)
         return self.linear[-1](a)
@@ -69,10 +74,8 @@ class PINN(nn.Module):
         # PDE parameters
         self.VF_mat1 = param['VF_mat1']
         self.VF_mat2 = param['VF_mat2']
-        # Ensure R matrices are tensors on the correct device/dtype to avoid numpy broadcasting issues
-        # during graph construction
-        self.R_mat1 = torch.tensor(param['R_mat1'], dtype=DTYPE).to(self.device)
-        self.R_mat2 = torch.tensor(param['R_mat2'], dtype=DTYPE).to(self.device)
+        self.R_mat1 = param['R_mat1']
+        self.R_mat2 = param['R_mat2']
 
         # NN
         self.layers = layers
@@ -80,26 +83,27 @@ class PINN(nn.Module):
         self.best_state = None  # Almacena el mejor estado (state_dict) para guardado al final de secuencia
         self.activation = nn.Tanh()
 
-        # Networks initialization
         self.fcn_mat1 = FCN(self.layers, self.device, activation=self.activation)
         self.fcn_mat2 = FCN(self.layers, self.device, activation=self.activation)
 
         self.fcn_mat1.to(self.device, dtype=DTYPE)
         self.fcn_mat2.to(self.device, dtype=DTYPE)
 
-        # AMP/compile desactivados: precisión fija float64
-
         # Optimizers
-        params = list(self.fcn_mat1.parameters()) + list(self.fcn_mat2.parameters())
-        self.optimizer_Adam = torch.optim.Adam(params, lr=ADAM_LR)
-        self.max_iter_LBFGS = 50
-        self.optimizer_LBFGS = torch.optim.LBFGS(
-            params,
-            max_iter=self.max_iter_LBFGS,
-            max_eval=self.max_iter_LBFGS,
-            tolerance_grad=1.0 * torch.finfo(DTYPE).eps,
-            history_size=50,
-        )
+        self.params = list(self.fcn_mat1.parameters()) + list(self.fcn_mat2.parameters())
+        self.optimizer_Adam = torch.optim.Adam(self.params, lr=ADAM_LR)
+
+        self.max_iter_LBFGS = int(LBFGS_MAX_ITER)
+        self._lbfgs_kwargs = {
+            'lr': float(LBFGS_LR),
+            'max_iter': self.max_iter_LBFGS,
+            'max_eval': int(LBFGS_MAX_EVAL_MULT) * self.max_iter_LBFGS,
+            'tolerance_grad': float(LBFGS_TOL_GRAD),
+            'tolerance_change': float(LBFGS_TOL_CHANGE),
+            'history_size': int(LBFGS_HISTORY_SIZE),
+            'line_search_fn': (LBFGS_LINE_SEARCH_FN if LBFGS_LINE_SEARCH_FN in (None, 'strong_wolfe') else 'strong_wolfe'),
+        }
+        self.optimizer_LBFGS = torch.optim.LBFGS(self.params, **self._lbfgs_kwargs)
 
         # Losses
         self.loss_fn = nn.MSELoss(reduction='mean')
@@ -107,6 +111,10 @@ class PINN(nn.Module):
         self.loss_collocation_log = []
         self.loss_interface_log = []
         self.loss_uniqueness_condition_log = []
+        # Logs de contribuciones ponderadas (w * L) para verificar balance
+        self.weighted_collocation_log = []
+        self.weighted_uniqueness_log = []
+        self.weighted_interface_log = []
         self.it = 0
         self.best_iter = 0
         self.log_every = 1
@@ -119,6 +127,20 @@ class PINN(nn.Module):
         self.mae_collocation = None
         self.mae_uniqueness = None
         self.mae_interface = None
+
+    def reset_lbfgs(self):
+        """Recreate LBFGS optimizer to reset its internal history/state."""
+        self.optimizer_LBFGS = torch.optim.LBFGS(self.params, **self._lbfgs_kwargs)
+
+    def reset_adam(self):
+        """Recreate Adam optimizer to reset momentum/state."""
+        self.optimizer_Adam = torch.optim.Adam(self.params, lr=ADAM_LR)
+
+    def reset_optimizers(self, adam: bool = True, lbfgs: bool = True):
+        if adam:
+            self.reset_adam()
+        if lbfgs:
+            self.reset_lbfgs()
 
     def forward_mat1(self, points: torch.Tensor) -> torch.Tensor:
         return self.fcn_mat1(points)
@@ -235,10 +257,10 @@ class PINN(nn.Module):
         return loss_interface1 + loss_interface2
 
     def loss(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Compute each term separately (no fused fast path)
         loss_uniqueness_condition = self.Loss_Uniqueness_Condition()
         loss_collocation = self.Loss_Collocation()
         loss_interface = self.Loss_Interface()
+
         if ADAPTIVE_WEIGHTS:
             loss_total = (
                 self.w_collocation * loss_collocation
@@ -253,7 +275,7 @@ class PINN(nn.Module):
         self.optimizer_Adam.zero_grad()
         loss_total, lc, lu, li = self.loss()
         loss_total.backward()
-        # self.optimizer_Adam.step() # OSCAR
+        self.optimizer_Adam.step()
         return loss_total, lc, lu, li
 
     def Log(self, loss_total, loss_collocation, loss_uniqueness_condition, loss_interface, pbar, it, log_every):
@@ -268,28 +290,46 @@ class PINN(nn.Module):
         self.loss_uniqueness_condition_log.append(loss_uniqueness_condition.item())
         self.loss_collocation_log.append(loss_collocation.item())
         self.loss_interface_log.append(loss_interface.item())
+        
+        # Registrar contribuciones ponderadas para verificar balance
+        with torch.no_grad():
+            self.weighted_collocation_log.append((self.w_collocation * loss_collocation).item())
+            self.weighted_uniqueness_log.append((self.w_uniqueness * loss_uniqueness_condition).item())
+            self.weighted_interface_log.append((self.w_interface * loss_interface).item())
 
         if pbar is not None and it % log_every == 0:
+            # Calcular contribuciones porcentuales para mostrar balance
+            wc = self.weighted_collocation_log[-1]
+            wu = self.weighted_uniqueness_log[-1]
+            wi = self.weighted_interface_log[-1]
+            total_w = wc + wu + wi + 1e-12
             pbar.set_postfix(
                 {
                     'Loss': loss_total.item(),
-                    'Residual loss': loss_collocation.item(),
-                    'Uniqueness condition': loss_uniqueness_condition.item(),
-                    'Interface loss': loss_interface.item(),
+                    'C%': f'{100*wc/total_w:.0f}',  # Porcentaje collocation
+                    'U%': f'{100*wu/total_w:.0f}',  # Porcentaje uniqueness
+                    'I%': f'{100*wi/total_w:.0f}',  # Porcentaje interface
                 }
             )
 
-    def train(self, nIter_Adam=100, nIter_LBFGS=100, log_every=100, progress: bool = False, callback=None, callback_every: int = 10):
+    def train(self, nIter_Adam=100, nIter_LBFGS=100, log_every=100, progress: bool = False, callback=None, callback_every: int = 10,
+              epoch_offset: int = 0, start_time_override: float | None = None, quiet: bool = False):
         """Entrena el modelo.
         Args:
             nIter_Adam: iteraciones fase Adam.
             nIter_LBFGS: iteraciones fase L-BFGS.
             log_every: frecuencia de logging interno.
             progress: si True muestra barra de progreso (tqdm); si False, modo silencioso.
+            epoch_offset: offset to add to printed iteration numbers (for multi-cycle runs).
+            start_time_override: if given, use this as t0 for elapsed-time prints (cumulative across cycles).
+            quiet: si True, suprime mensajes de iteración de Adam y LBFGS.
         """
         self.log_every = log_every
         total_iter = nIter_Adam + nIter_LBFGS
-        start_time = time.perf_counter()
+        # Allow per-model overrides for print cadences (used for later cycles)
+        adam_print_every = int(getattr(self, 'adam_print_every', ADAM_PRINT_EVERY))
+        lbfgs_print_every = int(getattr(self, 'lbfgs_print_every', LBFGS_PRINT_EVERY))
+        start_time = start_time_override if start_time_override is not None else time.perf_counter()
         if progress:
             from tqdm import trange
             self.pbar = trange(total_iter)
@@ -302,87 +342,90 @@ class PINN(nn.Module):
             self.it = it
             if it < nIter_Adam:
                 loss_total, loss_collocation, loss_uniqueness_condition, loss_interface = self.compute_loss_and_optimize()
-                self.optimizer_Adam.step()
-                # Adaptive weights update (simple inverse-loss moving average)
+                self.Log(loss_total, loss_collocation, loss_uniqueness_condition, loss_interface, self.pbar if progress else None, self.it, self.log_every)
                 if ADAPTIVE_WEIGHTS and ((it % 1) == 0):
                     with torch.no_grad():
-                        # Convert to scalars (avoid zero by adding tiny epsilon)
                         eps = torch.finfo(DTYPE).eps
                         c = loss_collocation.detach() + eps
                         u = loss_uniqueness_condition.detach() + eps
                         i = loss_interface.detach() + eps
-                        # Initialize moving averages
                         if self.mae_collocation is None:
                             self.mae_collocation = c
                             self.mae_uniqueness = u
                             self.mae_interface = i
-                        # Exponential moving average
                         beta = torch.tensor(ADAPTIVE_BETA, dtype=DTYPE, device=self.device)
                         self.mae_collocation = beta * self.mae_collocation + (1 - beta) * c
                         self.mae_uniqueness = beta * self.mae_uniqueness + (1 - beta) * u
                         self.mae_interface = beta * self.mae_interface + (1 - beta) * i
-                        # Target average = mean of MAs
-                        avg = (self.mae_collocation + self.mae_uniqueness + self.mae_interface) / 3.0
-                        # Inverse proportional weights to bring terms to similar scale
-                        wc = (avg / self.mae_collocation).clamp(WEIGHT_MIN, WEIGHT_MAX)
-                        wu = (avg / self.mae_uniqueness).clamp(WEIGHT_MIN, WEIGHT_MAX)
-                        wi = (avg / self.mae_interface).clamp(WEIGHT_MIN, WEIGHT_MAX)
-                        # Normalize weights to keep sum ~ 3
-                        s = wc + wu + wi
-                        self.w_collocation = 3.0 * wc / s
-                        self.w_uniqueness = 3.0 * wu / s
-                        self.w_interface = 3.0 * wi / s
-                if progress and LOG_WEIGHTS and (it % self.log_every == 0) and ADAPTIVE_WEIGHTS and self.pbar is not None:
-                    self.pbar.set_description(f"wC={float(self.w_collocation):.2f}, wU={float(self.w_uniqueness):.2f}, wI={float(self.w_interface):.2f}")
-                self.Log(loss_total, loss_collocation, loss_uniqueness_condition, loss_interface, self.pbar if progress else None, self.it, self.log_every)
-                # Optional callback for external logging (e.g., relative error checkpoints)
+
+                        wc_raw = 1.0 / self.mae_collocation
+                        wu_raw = 1.0 / self.mae_uniqueness
+                        wi_raw = 1.0 / self.mae_interface
+
+                        geom_mean = (wc_raw * wu_raw * wi_raw) ** (1.0/3.0)
+                        scale = 1.0 / (geom_mean + eps)
+
+                        self.w_collocation = (wc_raw * scale).clamp(WEIGHT_MIN, WEIGHT_MAX)
+                        self.w_uniqueness = (wu_raw * scale).clamp(WEIGHT_UNIQUENESS_MIN, WEIGHT_MAX)
+                        self.w_interface = (wi_raw * scale).clamp(WEIGHT_MIN, WEIGHT_MAX)
+
                 try:
                     if callback is not None and ((it + 1) % callback_every == 0):
                         callback(self, it + 1)
                 except Exception:
                     pass
-                # Print elapsed time periodically for long runs
                 try:
-                    if (it + 1) % 1000 == 0:
+                    if not quiet and (it + 1) % adam_print_every == 0:
                         elapsed = time.perf_counter() - start_time
-                        # include current sweeping param/value info if available on self
-                        meta_info = ''
-                        try:
-                            pname = getattr(self, 'sweep_param_name', None)
-                            pval = getattr(self, 'sweep_param_value', None)
-                            if pname is not None and pval is not None:
-                                meta_info = f" para {pname}={pval}"
-                        except Exception:
-                            meta_info = ''
-                        print(f"[Time] Adam: elapsed {elapsed:.2f}s after {it+1} iterations{meta_info}")
+                        global_it = it + 1 + epoch_offset
+                        print(f"[Time] Adam: elapsed {elapsed:.2f}s after {global_it} iterations (cycle-local {it+1})")
                 except Exception:
                     pass
             else:
-                # Cambio de fase (silencioso si progress=False)
-                if progress and it == nIter_Adam:
+                if progress and it == nIter_Adam and not quiet:
                     print("Switching to L-BFGS for fine-tuning...")
+
+                _last_lbfgs = {}
 
                 def closure():
                     self.optimizer_LBFGS.zero_grad()
-                    # AMP desactivado para LBFGS
                     loss_total, loss_collocation, loss_uniqueness_condition, loss_interface = self.loss()
                     loss_total.backward()
-                    self.Log(loss_total, loss_collocation, loss_uniqueness_condition, loss_interface, self.pbar if progress else None, self.it, self.log_every)
+                    try:
+                        _last_lbfgs['lt'] = loss_total.detach()
+                        _last_lbfgs['lc'] = loss_collocation.detach()
+                        _last_lbfgs['lu'] = loss_uniqueness_condition.detach()
+                        _last_lbfgs['li'] = loss_interface.detach()
+                    except Exception:
+                        pass
                     return loss_total
 
                 self.optimizer_LBFGS.step(closure)
-                # Invoke callback at LBFGS iterations too (epoch counting continues)
+
+                try:
+                    if all(k in _last_lbfgs for k in ('lt', 'lc', 'lu', 'li')):
+                        self.Log(
+                            _last_lbfgs['lt'],
+                            _last_lbfgs['lc'],
+                            _last_lbfgs['lu'],
+                            _last_lbfgs['li'],
+                            self.pbar if progress else None,
+                            self.it,
+                            self.log_every,
+                        )
+                except Exception:
+                    pass
                 try:
                     if callback is not None and ((it + 1) % callback_every == 0):
                         callback(self, it + 1)
                 except Exception:
                     pass
-                # Print elapsed time periodically during LBFGS phase
                 try:
                     lbfgs_iter = it - nIter_Adam + 1
-                    if lbfgs_iter > 0 and (lbfgs_iter % 100 == 0):
+                    if not quiet and lbfgs_iter > 0 and (lbfgs_iter % lbfgs_print_every == 0):
                         elapsed = time.perf_counter() - start_time
-                        print(f"[Time] L-BFGS: elapsed {elapsed:.2f}s after LBFGS iter {lbfgs_iter} (global it {it+1})")
+                        global_it = it + 1 + epoch_offset
+                        print(f"[Time] L-BFGS: elapsed {elapsed:.2f}s after LBFGS iter {lbfgs_iter} (global it {global_it})")
                 except Exception:
                     pass
 
@@ -391,7 +434,6 @@ class PINN(nn.Module):
         else:
             self.best_iter = nIter_Adam - 1 + (self.best_iter - nIter_Adam + 1) * self.max_iter_LBFGS
 
-        # print("The best model is obtained in EPOCH =" + f"{self.best_iter}.")
         return self.best_iter, self.loss_log
 
     def Effective_Properties(self, points1, points2, device: torch.device) -> tuple[float, float, float, float, float, float]:
