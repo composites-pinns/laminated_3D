@@ -56,3 +56,20 @@ LBFGS_HISTORY_SIZE = 10
 LBFGS_LINE_SEARCH_FN = 'strong_wolfe'
 LBFGS_TOL_GRAD = 1e-9
 LBFGS_TOL_CHANGE = 1e-12
+
+# NysNewton-CG parameters
+EPOCH_NNCG = 50                    # iterations per cycle (first cycle)
+EPOCH_NNCG_FOLLOWING_CYCLES = 50   # iterations per cycle (subsequent cycles)
+NNCG_RANK = 10                     # rank of the Nyström sketch
+NNCG_MU = 1e-4                     # Tikhonov regularisation
+NNCG_CG_TOL = 1e-5                # CG relative residual tolerance
+NNCG_MAX_CG_ITERS = 50            # max CG iterations per step
+NNCG_LINE_SEARCH = True           # Armijo back-tracking line search
+NNCG_LR = 1.0                     # learning rate / step size
+NNCG_PRINT_EVERY = 10             # print cadence
+NNCG_LATERCYCLES_PRINT_EVERY = 10 # print cadence for later cycles
+
+# Convergence control
+CONVERGENCE_WINDOW = 3             # moving-average window (number of cycles)
+MIN_CYCLES_BEFORE_CHECK = 5       # first cycle at which convergence is evaluated
+CV_WINDOW = 3                      # window for coefficient-of-variation criterion

@@ -10,7 +10,7 @@ Usage:
     python generate_paper_figures.py [--results-dir <path>] [--output-dir <path>]
 
 Defaults:
-    --results-dir  final_results_multirun_n20_tol0.01
+    --results-dir  final_results_multirun
     --output-dir   PAPER/figs
 """
 
@@ -428,7 +428,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     parser.add_argument(
         "--results-dir",
-        default=os.path.join(script_dir, "final_results_multirun_n20_tol0.01"),
+        default=os.path.join(script_dir, "final_results_multirun"),
         help="Path to the multirun results folder",
     )
     parser.add_argument(

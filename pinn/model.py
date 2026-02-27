@@ -10,7 +10,10 @@ from .config import (
     LBFGS_LR, LBFGS_MAX_ITER, LBFGS_MAX_EVAL_MULT, LBFGS_HISTORY_SIZE,
     LBFGS_LINE_SEARCH_FN, LBFGS_TOL_GRAD, LBFGS_TOL_CHANGE,
     WEIGHT_UNIQUENESS_MIN,
+    NNCG_RANK, NNCG_MU, NNCG_CG_TOL, NNCG_MAX_CG_ITERS,
+    NNCG_LINE_SEARCH, NNCG_LR, NNCG_PRINT_EVERY,
 )
+from optimizer.nys_newton_cg import NysNewtonCG
 
 
 class FCN(nn.Module):
@@ -105,6 +108,17 @@ class PINN(nn.Module):
         }
         self.optimizer_LBFGS = torch.optim.LBFGS(self.params, **self._lbfgs_kwargs)
 
+        # NysNewton-CG optimizer
+        self._nncg_kwargs = {
+            'lr': float(NNCG_LR),
+            'rank': int(NNCG_RANK),
+            'mu': float(NNCG_MU),
+            'cg_tol': float(NNCG_CG_TOL),
+            'max_cg_iters': int(NNCG_MAX_CG_ITERS),
+            'line_search': bool(NNCG_LINE_SEARCH),
+        }
+        self.optimizer_NNCG = NysNewtonCG(self.params, **self._nncg_kwargs)
+
         # Losses
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.loss_log = []
@@ -136,11 +150,17 @@ class PINN(nn.Module):
         """Recreate Adam optimizer to reset momentum/state."""
         self.optimizer_Adam = torch.optim.Adam(self.params, lr=ADAM_LR)
 
-    def reset_optimizers(self, adam: bool = True, lbfgs: bool = True):
+    def reset_nncg(self):
+        """Recreate NysNewton-CG optimizer to reset its internal state."""
+        self.optimizer_NNCG = NysNewtonCG(self.params, **self._nncg_kwargs)
+
+    def reset_optimizers(self, adam: bool = True, lbfgs: bool = True, nncg: bool = True):
         if adam:
             self.reset_adam()
         if lbfgs:
             self.reset_lbfgs()
+        if nncg:
+            self.reset_nncg()
 
     def forward_mat1(self, points: torch.Tensor) -> torch.Tensor:
         return self.fcn_mat1(points)
@@ -312,12 +332,13 @@ class PINN(nn.Module):
                 }
             )
 
-    def train(self, nIter_Adam=100, nIter_LBFGS=100, log_every=100, progress: bool = False, callback=None, callback_every: int = 10,
+    def train(self, nIter_Adam=100, nIter_LBFGS=100, nIter_NNCG=0, log_every=100, progress: bool = False, callback=None, callback_every: int = 10,
               epoch_offset: int = 0, start_time_override: float | None = None, quiet: bool = False):
         """Entrena el modelo.
         Args:
             nIter_Adam: iteraciones fase Adam.
             nIter_LBFGS: iteraciones fase L-BFGS.
+            nIter_NNCG: iteraciones fase NysNewton-CG.
             log_every: frecuencia de logging interno.
             progress: si True muestra barra de progreso (tqdm); si False, modo silencioso.
             epoch_offset: offset to add to printed iteration numbers (for multi-cycle runs).
@@ -325,10 +346,11 @@ class PINN(nn.Module):
             quiet: si True, suprime mensajes de iteración de Adam y LBFGS.
         """
         self.log_every = log_every
-        total_iter = nIter_Adam + nIter_LBFGS
+        total_iter = nIter_Adam + nIter_LBFGS + nIter_NNCG
         # Allow per-model overrides for print cadences (used for later cycles)
         adam_print_every = int(getattr(self, 'adam_print_every', ADAM_PRINT_EVERY))
         lbfgs_print_every = int(getattr(self, 'lbfgs_print_every', LBFGS_PRINT_EVERY))
+        nncg_print_every = int(getattr(self, 'nncg_print_every', NNCG_PRINT_EVERY))
         start_time = start_time_override if start_time_override is not None else time.perf_counter()
         if progress:
             from tqdm import trange
@@ -337,6 +359,8 @@ class PINN(nn.Module):
         else:
             self.pbar = None
             iterator = range(total_iter)
+
+        lbfgs_end = nIter_Adam + nIter_LBFGS
 
         for it in iterator:
             self.it = it
@@ -381,7 +405,8 @@ class PINN(nn.Module):
                         print(f"[Time] Adam: elapsed {elapsed:.2f}s after {global_it} iterations (cycle-local {it+1})")
                 except Exception:
                     pass
-            else:
+            elif it < lbfgs_end:
+                # ── L-BFGS phase ──
                 if progress and it == nIter_Adam and not quiet:
                     print("Switching to L-BFGS for fine-tuning...")
 
@@ -426,6 +451,55 @@ class PINN(nn.Module):
                         elapsed = time.perf_counter() - start_time
                         global_it = it + 1 + epoch_offset
                         print(f"[Time] L-BFGS: elapsed {elapsed:.2f}s after LBFGS iter {lbfgs_iter} (global it {global_it})")
+                except Exception:
+                    pass
+            else:
+                # ── NysNewton-CG phase ──
+                if progress and it == lbfgs_end and not quiet:
+                    print("Switching to NysNewton-CG for second-order refinement...")
+
+                _last_nncg = {}
+
+                def nncg_closure():
+                    # NysNewtonCG computes gradients internally via
+                    # autograd.grad – the closure only needs to return
+                    # the (graph-connected) scalar loss.
+                    loss_total, loss_collocation, loss_uniqueness_condition, loss_interface = self.loss()
+                    try:
+                        _last_nncg['lt'] = loss_total.detach()
+                        _last_nncg['lc'] = loss_collocation.detach()
+                        _last_nncg['lu'] = loss_uniqueness_condition.detach()
+                        _last_nncg['li'] = loss_interface.detach()
+                    except Exception:
+                        pass
+                    return loss_total
+
+                self.optimizer_NNCG.step(nncg_closure)
+
+                try:
+                    if all(k in _last_nncg for k in ('lt', 'lc', 'lu', 'li')):
+                        self.Log(
+                            _last_nncg['lt'],
+                            _last_nncg['lc'],
+                            _last_nncg['lu'],
+                            _last_nncg['li'],
+                            self.pbar if progress else None,
+                            self.it,
+                            self.log_every,
+                        )
+                except Exception:
+                    pass
+                try:
+                    if callback is not None and ((it + 1) % callback_every == 0):
+                        callback(self, it + 1)
+                except Exception:
+                    pass
+                try:
+                    nncg_iter = it - lbfgs_end + 1
+                    if not quiet and nncg_iter > 0 and (nncg_iter % nncg_print_every == 0):
+                        elapsed = time.perf_counter() - start_time
+                        global_it = it + 1 + epoch_offset
+                        print(f"[Time] NNCG: elapsed {elapsed:.2f}s after NNCG iter {nncg_iter} (global it {global_it})")
                 except Exception:
                     pass
 
