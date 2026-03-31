@@ -12,16 +12,21 @@ from .config import (
     WEIGHT_UNIQUENESS_MIN,
     NNCG_RANK, NNCG_MU, NNCG_CG_TOL, NNCG_MAX_CG_ITERS,
     NNCG_LINE_SEARCH, NNCG_LR, NNCG_PRINT_EVERY,
+    NORMALIZE_LOSS_BY_MATERIAL,
 )
 from optimizer.nys_newton_cg import NysNewtonCG
 
 
 class FCN(nn.Module):
-    def __init__(self, layers: List[int], device: torch.device, activation: nn.Module | None = None):
+    def __init__(self, layers: List[int], device: torch.device,
+                 activation: nn.Module | None = None,
+                 domain_bounds: tuple[float, float] | None = None):
         super().__init__()
         self.device = device
         self.layers = layers
         self.activation = activation or nn.Tanh()
+        # Per-domain normalisation: maps [y_min, y_max] → [-1, 1]
+        self.domain_bounds = domain_bounds
 
         self.linear = nn.ModuleList([nn.Linear(layers[i], layers[i + 1])
                                       for i in range(len(layers) - 1)])
@@ -35,7 +40,11 @@ class FCN(nn.Module):
         a = X.to(dtype=DTYPE)
 
         if NORMALIZE_INPUTS:
-            a = 2.0 * a - 1.0
+            if self.domain_bounds is not None:
+                y_min, y_max = self.domain_bounds
+                a = 2.0 * (a - y_min) / (y_max - y_min) - 1.0
+            else:
+                a = 2.0 * a - 1.0
 
         for i in range(len(self.linear) - 1):
             z = self.linear[i](a)
@@ -77,8 +86,21 @@ class PINN(nn.Module):
         # PDE parameters
         self.VF_mat1 = param['VF_mat1']
         self.VF_mat2 = param['VF_mat2']
-        self.R_mat1 = param['R_mat1']
-        self.R_mat2 = param['R_mat2']
+
+        # Non-dimensionalise stiffness matrices so that every loss term
+        # (PDE, traction, continuity, uniqueness) lives at the same O(1)
+        # scale.  The corrector functions χ are scale-invariant, so the
+        # only effect is to multiply Effective_Properties by C_ref.
+        if NORMALIZE_LOSS_BY_MATERIAL:
+            self.C_ref = float(max(
+                np.linalg.norm(param['R_mat1'], 'fro'),
+                np.linalg.norm(param['R_mat2'], 'fro')))
+            self.R_mat1 = param['R_mat1'] / self.C_ref
+            self.R_mat2 = param['R_mat2'] / self.C_ref
+        else:
+            self.C_ref = 1.0
+            self.R_mat1 = param['R_mat1']
+            self.R_mat2 = param['R_mat2']
 
         # NN
         self.layers = layers
@@ -86,8 +108,13 @@ class PINN(nn.Module):
         self.best_state = None  # Almacena el mejor estado (state_dict) para guardado al final de secuencia
         self.activation = nn.Tanh()
 
-        self.fcn_mat1 = FCN(self.layers, self.device, activation=self.activation)
-        self.fcn_mat2 = FCN(self.layers, self.device, activation=self.activation)
+        # Per-domain input normalisation: each sub-network maps its own
+        # sub-domain [0, y_I] or [y_I, 1] to [-1, 1].
+        y_I = float(self.VF_mat1)
+        self.fcn_mat1 = FCN(self.layers, self.device, activation=self.activation,
+                            domain_bounds=(0.0, y_I))
+        self.fcn_mat2 = FCN(self.layers, self.device, activation=self.activation,
+                            domain_bounds=(y_I, 1.0))
 
         self.fcn_mat1.to(self.device, dtype=DTYPE)
         self.fcn_mat2.to(self.device, dtype=DTYPE)
@@ -269,6 +296,7 @@ class PINN(nn.Module):
             + nn.functional.mse_loss(Chi2p_mat1_pred - Chi2p_mat2_pred, self.null_inter)
             + nn.functional.mse_loss(Chi3p_mat1_pred - Chi3p_mat2_pred, self.null_inter)
         )
+
         loss_interface2 = (
             nn.functional.mse_loss(equ11 - equ12, self.null_inter)
             + nn.functional.mse_loss(equ21 - equ22, self.null_inter)
@@ -542,11 +570,13 @@ class PINN(nn.Module):
         R5p_eff = Eff_Coef(y_mat1, y_mat2, i=5)
         R6p_eff = Eff_Coef(y_mat1, y_mat2, i=6)
 
+        # Undo the non-dimensionalisation applied in __init__
+        s = self.C_ref
         return (
-            R1p_eff.detach().cpu().numpy()[0],
-            R2p_eff.detach().cpu().numpy()[0],
-            R3p_eff.detach().cpu().numpy()[0],
-            R4p_eff.detach().cpu().numpy()[0],
-            R5p_eff.detach().cpu().numpy()[0],
-            R6p_eff.detach().cpu().numpy()[0],
+            (s * R1p_eff).detach().cpu().numpy()[0],
+            (s * R2p_eff).detach().cpu().numpy()[0],
+            (s * R3p_eff).detach().cpu().numpy()[0],
+            (s * R4p_eff).detach().cpu().numpy()[0],
+            (s * R5p_eff).detach().cpu().numpy()[0],
+            (s * R6p_eff).detach().cpu().numpy()[0],
         )

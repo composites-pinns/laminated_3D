@@ -41,6 +41,7 @@ N_UNIQUENESS = 2000
 N_POINTS = 2000
 
 NORMALIZE_INPUTS = True
+NORMALIZE_LOSS_BY_MATERIAL = True   # Non-dimensionalise PDE & interface residuals per-material
 ADAPTIVE_WEIGHTS = True
 ADAPTIVE_BETA = 0.99
 WEIGHT_MIN = 1e-6
