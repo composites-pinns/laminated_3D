@@ -58,15 +58,15 @@ EXACT_VALUES = {
 
 # Nice LaTeX-like labels for each coefficient
 LABELS = {
-    "R11_eff": r"$\~R_{11}$",
-    "R12_eff": r"$\~R_{12}$",
-    "R13_eff": r"$\~R_{13}$",
-    "R22_eff": r"$\~R_{22}$",
-    "R23_eff": r"$\~R_{23}$",
-    "R33_eff": r"$\~R_{33}$",
-    "R44_eff": r"$\~R_{44}$",
-    "R55_eff": r"$\~R_{55}$",
-    "R66_eff": r"$\~R_{66}$",
+    "R11_eff": r"$\~C_{11}$",
+    "R12_eff": r"$\~C_{12}$",
+    "R13_eff": r"$\~C_{13}$",
+    "R22_eff": r"$\~C_{22}$",
+    "R23_eff": r"$\~C_{23}$",
+    "R33_eff": r"$\~C_{33}$",
+    "R44_eff": r"$\~C_{44}$",
+    "R55_eff": r"$\~C_{55}$",
+    "R66_eff": r"$\~C_{66}$",
 }
 
 # Ordered list of properties for plotting
@@ -165,12 +165,12 @@ def fig_boxplot(results_dir: str, output_dir: str):
 
 
 # ---------------------------------------------------------------------------
-# Figure 2 – Overlay of R_eff convergence trajectories (all runs, p=1 & p=3)
+# Figure 2 – Overlay of C_eff convergence trajectories (all runs, p=1 & p=3)
 # ---------------------------------------------------------------------------
 def fig_convergence_overlay(results_dir: str, output_dir: str,
                             problems=(1, 3)):
     """
-    For each problem in `problems`, overlay the R_eff(cycle) trajectories
+    For each problem in `problems`, overlay the C_eff(cycle) trajectories
     of all 20 runs, highlighting the spread and convergence to the exact value.
     """
     run_dirs = discover_run_dirs(results_dir)
@@ -190,7 +190,7 @@ def fig_convergence_overlay(results_dir: str, output_dir: str,
                 continue
             rows = read_csv(csv_path)
             cycles = [int(r["cycle"]) for r in rows]
-            preds = [float(r["R_eff_pred"]) for r in rows]
+            preds = [float(r["R_eff_pred"]) for r in rows] 
             if cycles:
                 max_cycle = max(max_cycle, max(cycles))
             label = None if i > 0 else "Individual runs"
@@ -266,7 +266,7 @@ def fig_loss_components(results_dir: str, output_dir: str,
 
     # Apply EMA smoothing for readability
     alpha = 0.02
-    def ema(y, a=alpha):
+    def ema(y, a=alpha): 
         out = np.empty_like(y)
         out[0] = y[0]
         for i in range(1, len(y)):
@@ -317,8 +317,9 @@ def fig_loss_components(results_dir: str, output_dir: str,
 def fig_reff_evolution(results_dir: str, output_dir: str,
                        run_index: int = 1, problem: int = 1):
     """
-    Plot the predicted R_eff per cycle for a single representative run,
-    marking the analytical value as a dashed line.
+    Plot the per-epoch evolution of R*_pp during training for a single
+    representative run, with Adam→L-BFGS transition markers and the
+    analytical (exact) reference line.
     """
     run_dirs = discover_run_dirs(results_dir)
     if run_index > len(run_dirs):
@@ -326,39 +327,71 @@ def fig_reff_evolution(results_dir: str, output_dir: str,
         return
 
     rd = run_dirs[run_index - 1]
-    csv_path = os.path.join(rd, "data", f"p{problem}_reff_history.csv")
+    csv_path = os.path.join(rd, "data", f"p{problem}_relerr.csv")
     if not os.path.isfile(csv_path):
         print(f"  [reff_evolution] File not found: {csv_path} — skipping.")
         return
 
     rows = read_csv(csv_path)
-    cycles = [int(r["cycle"]) for r in rows]
-    preds = [float(r["R_eff_pred"]) for r in rows]
+    epochs = np.array([int(r["epoch"]) for r in rows], dtype=float)
+    preds = np.array([float(r[f"R_eff_pred_p{problem}"]) for r in rows])
     prop_key = f"R{problem}{problem}_eff"
     exact = EXACT_VALUES[prop_key]
 
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(cycles, preds, "o-", color="#2171B5", markersize=4, linewidth=1.5,
-            label=f"PINN prediction")
-    ax.axhline(exact, color="#D94801", linestyle="--", linewidth=1.3,
-               label=f"AHM exact = {exact:.2f}")
+    # Compute final relative error
+    final_rel_err = abs(preds[-1] - exact) / abs(exact) * 100
 
-    ax.set_xlabel("Training cycle")
-    ax.set_ylabel(f"{LABELS[prop_key]} (GPa)")
-    ax.set_title(
-        f"Convergence of {LABELS[prop_key]} — "
-        f"run {run_index}"
-    )
-    ax.legend(loc="upper right", framealpha=0.9)
-    ax.set_xlim(left=0.5, right=max(cycles) + 0.5)
+    # --- Adam → L-BFGS transition epochs ---
+    # Cycle 0: Adam 0-1999, L-BFGS 2000-2499  →  transition at 2000
+    # Cycle n (n>=1): Adam 100 epochs, L-BFGS 100 epochs (200 per cycle)
+    #   transition at 2500 + (n-1)*200 + 100
+    max_epoch = int(epochs[-1])
+    transitions = [2000]  # cycle 0
+    n = 1
+    while True:
+        t = 2500 + (n - 1) * 200 + 100
+        if t > max_epoch:
+            break
+        transitions.append(t)
+        n += 1
+
+    # --- LaTeX label for R*_pp ---
+    lbl = rf"$C^*_{{{problem}{problem}}}$"
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    # Predicted curve
+    ax.plot(epochs, preds, color="blue", linewidth=1.3, label=f"{lbl} predicted")
+
+    # Exact horizontal line
+    ax.axhline(exact, color="red", linestyle="--", linewidth=2.0,
+               label=f"{lbl} exact = {exact:.4f}")
+
+    # Adam → L-BFGS vertical markers
+    for i, t in enumerate(transitions):
+        ax.axvline(t, color="#DAA520", linestyle="--", linewidth=1.0,
+                   label=r"Adam $\rightarrow$ L-BFGS" if i == 0 else None)
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(lbl)
+    ax.set_title(f"Evolution of {lbl} during training")
+    ax.legend(loc="upper left", framealpha=0.9)
+    ax.set_xlim(left=0, right=max_epoch)
+
+    # Final relative error text box (bottom-right)
+    textstr = f"Final relative error: {final_rel_err:.2f}%"
+    props = dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.8,
+                 edgecolor="gray")
+    ax.text(0.98, 0.95, textstr, transform=ax.transAxes, fontsize=9,
+            verticalalignment="bottom", horizontalalignment="right", bbox=props)
 
     plt.tight_layout()
-    out_pdf = os.path.join(output_dir, f"reff_evolution_p{problem}.pdf")
-    out_png = os.path.join(output_dir, f"reff_evolution_p{problem}.png")
+    out_pdf = os.path.join(output_dir, f"ceff_evolution_p{problem}.pdf")
+    out_png = os.path.join(output_dir, f"ceff_evolution_p{problem}.png")
     fig.savefig(out_pdf)
     fig.savefig(out_png, dpi=300)
     plt.close(fig)
-    print(f"  [reff_evolution] saved → {out_pdf}")
+    print(f"  [ceff_evolution] saved → {out_pdf}")
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +424,7 @@ def fig_loss_total(results_dir: str, output_dir: str,
         out[0] = y[0]
         for i in range(1, len(y)):
             out[i] = a * y[i] + (1 - a) * out[i - 1]
-        return out
+        return y # Debería ser `return out` pero se ha dejado `return y` para mostrar la curva sin suavizar.
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(epochs, ema(loss_total), color="#2171B5", linewidth=1.5)

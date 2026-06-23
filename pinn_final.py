@@ -30,6 +30,8 @@ Uso:
   python pinn_final.py --n-runs 10 --base-seed 42  # Multi-run con seed base específico
   python pinn_final.py --quiet-iterations   # Silenciar mensajes de iteración Adam/LBFGS
   python pinn_final.py --truncate-pct 25    # Media truncada: elimina 25% por cada lado
+  python pinn_final.py --stop pde-residual   # Criterio de parada basado en residuo PDE
+  python pinn_final.py --stop cv             # Criterio de parada basado en coeficiente de variación
 """
 
 import os
@@ -81,6 +83,20 @@ DEFAULT_N_RUNS = 10
 # Porcentaje de valores extremos a quitar para media truncada (por cada lado)
 # Por ejemplo, 20 = 20%, si N=20 se quitan 4 arriba y 4 abajo
 DEFAULT_TRUNCATE_PCT = 20
+
+# Criterios de parada válidos
+VALID_STOP_CRITERIA = ('simple', 'pde-residual', 'cv')
+DEFAULT_STOP_CRITERION = 'simple'
+
+# PDE-residual: umbral por defecto del residuo L2 normalizado
+DEFAULT_PDE_RESIDUAL_TOL = 1e-7
+# PDE-residual: número de puntos de validación (independientes de entrenamiento)
+N_VALIDATION_COLLOCATION = 500
+
+# CV: coeficiente de variación máximo para considerar convergencia
+DEFAULT_CV_TOL = 0.0001  # 0.01%
+# CV: ventana de ciclos sobre la que calcular el CV
+CV_WINDOW = 5
 
 
 # ==============================================================================
@@ -421,17 +437,113 @@ def compute_final_reff(reff_history: List[float]) -> tuple:
         return sum(last_values) / len(last_values), 'mean'
 
 
+def compute_pde_residual_on_validation(model: PINN, device: torch.device) -> float:
+    """
+    Calcula la norma L2 media del residuo PDE en puntos de validación
+    independientes de los de entrenamiento.
+    
+    Genera N_VALIDATION_COLLOCATION puntos aleatorios en cada material
+    (con seed fija para reproducibilidad entre ciclos) y evalúa el
+    residuo de las ecuaciones de equilibrio R·χ'' = 0.
+    
+    Returns:
+        Residuo L2 medio (float). Valores más pequeños → mejor convergencia.
+    """
+    import torch.nn as nn
+    
+    # Generar puntos de validación (seed fija distinta de entrenamiento)
+    rng_state = np.random.get_state()
+    np.random.seed(999999)
+    y_val_mat1 = np.random.uniform(0, VF_mat1, N_VALIDATION_COLLOCATION)[:, None]
+    y_val_mat2 = np.random.uniform(VF_mat1, 1, N_VALIDATION_COLLOCATION)[:, None]
+    np.random.set_state(rng_state)
+    
+    y1 = torch.tensor(y_val_mat1, requires_grad=True, dtype=DTYPE).to(device)
+    y2 = torch.tensor(y_val_mat2, requires_grad=True, dtype=DTYPE).to(device)
+    
+    model.eval()
+    with torch.enable_grad():
+        # Material 1
+        Chi1 = model.forward_mat1(y1)
+        # Material 2
+        Chi2 = model.forward_mat2(y2)
+        
+        def second_derivs(pred, y):
+            grads_second = []
+            for col in range(pred.shape[1]):
+                comp = pred[:, col:col+1]
+                g1 = torch.autograd.grad(comp, y, grad_outputs=torch.ones_like(comp), create_graph=True, retain_graph=True)[0]
+                g2 = torch.autograd.grad(g1, y, grad_outputs=torch.ones_like(g1), create_graph=False, retain_graph=True)[0]
+                grads_second.append(g2)
+            return grads_second
+        
+        Chi1_yy = second_derivs(Chi1, y1)
+        Chi2_yy = second_derivs(Chi2, y2)
+        
+        a = 1
+        R1 = model.R_mat1
+        R2 = model.R_mat2
+        
+        # Residuos en material 1 (3 ecuaciones)
+        equ11 = R1[5-a,5-a]*Chi1_yy[0] + R1[5-a,4-a]*Chi1_yy[1] + R1[5-a,3-a]*Chi1_yy[2]
+        equ12 = R1[4-a,5-a]*Chi1_yy[0] + R1[4-a,4-a]*Chi1_yy[1] + R1[4-a,3-a]*Chi1_yy[2]
+        equ13 = R1[3-a,5-a]*Chi1_yy[0] + R1[3-a,4-a]*Chi1_yy[1] + R1[3-a,3-a]*Chi1_yy[2]
+        
+        # Residuos en material 2 (3 ecuaciones)
+        equ21 = R2[5-a,5-a]*Chi2_yy[0] + R2[5-a,4-a]*Chi2_yy[1] + R2[5-a,3-a]*Chi2_yy[2]
+        equ22 = R2[4-a,5-a]*Chi2_yy[0] + R2[4-a,4-a]*Chi2_yy[1] + R2[4-a,3-a]*Chi2_yy[2]
+        equ23 = R2[3-a,5-a]*Chi2_yy[0] + R2[3-a,4-a]*Chi2_yy[1] + R2[3-a,3-a]*Chi2_yy[2]
+        
+        residual = (
+            equ11.pow(2).mean() + equ12.pow(2).mean() + equ13.pow(2).mean()
+            + equ21.pow(2).mean() + equ22.pow(2).mean() + equ23.pow(2).mean()
+        )
+    
+    model.train()
+    return float(residual.detach().cpu().item())
+
+
+def compute_cv(values: List[float]) -> float:
+    """
+    Calcula el coeficiente de variación (CV = σ/|μ|) de una lista de valores.
+    
+    Returns:
+        CV como fracción (no porcentaje). Devuelve inf si μ ≈ 0.
+    """
+    if len(values) < 2:
+        return float('inf')
+    mu = statistics.mean(values)
+    if abs(mu) < 1e-15:
+        return float('inf')
+    sigma = statistics.stdev(values)
+    return sigma / abs(mu)
+
+
 def train_until_convergence(model: PINN, p: int, device: torch.device,
                             n_adam: int, n_lbfgs: int, log_every: int,
                             progress: bool, callback=None, callback_every: int = 10,
                             tolerance: float = DEFAULT_CONVERGENCE_TOLERANCE,
-                            max_cycles: int = 100, quiet: bool = False):
+                            max_cycles: int = 100, quiet: bool = False,
+                            stop_criterion: str = DEFAULT_STOP_CRITERION):
     """
-    Entrena el modelo con ciclos (Adam + LBFGS) hasta que R_eff converja.
+    Entrena el modelo con ciclos (Adam + LBFGS) hasta convergencia.
     
-    Criterio de convergencia:
-    - A partir del ciclo MIN_CYCLES_BEFORE_CHECK, si la diferencia entre la media
-      de R_eff actual y la de hace CONVERGENCE_WINDOW ciclos es menor que tolerance%, se para.
+    Criterios de parada disponibles (--stop):
+    
+      'simple' (por defecto):
+        Compara la media móvil de R_eff actual con la de hace CONVERGENCE_WINDOW
+        ciclos. Converge cuando la diferencia relativa < tolerance%.
+    
+      'pde-residual':
+        Evalúa el residuo L2 de la PDE (R·χ'' = 0) en puntos de validación
+        independientes de los de entrenamiento. Converge cuando
+        residuo < DEFAULT_PDE_RESIDUAL_TOL y además se ha superado
+        MIN_CYCLES_BEFORE_CHECK ciclos.
+    
+      'cv':
+        Calcula el coeficiente de variación (CV = σ/μ) de los últimos CV_WINDOW
+        valores de R_eff. Converge cuando CV < DEFAULT_CV_TOL y se ha superado
+        MIN_CYCLES_BEFORE_CHECK ciclos.
     
     Args:
         model: Modelo PINN a entrenar
@@ -444,8 +556,10 @@ def train_until_convergence(model: PINN, p: int, device: torch.device,
         callback: Función callback(model, epoch)
         callback_every: Frecuencia del callback
         tolerance: Tolerancia de convergencia en porcentaje (default 0.05%)
+                   Usado sólo por el criterio 'simple'.
         max_cycles: Número máximo de ciclos (para evitar bucles infinitos)
         quiet: Si True, suprime mensajes de iteración de Adam y LBFGS.
+        stop_criterion: Criterio de parada: 'simple', 'pde-residual' o 'cv'.
     
     Returns:
         Dict con información de convergencia:
@@ -455,14 +569,20 @@ def train_until_convergence(model: PINN, p: int, device: torch.device,
             'reff_final': valor final de R_eff,
             'reff_method': 'last' o 'mean',
             'reff_history': lista de R_eff al final de cada ciclo,
-            'total_epochs': épocas totales ejecutadas
+            'total_epochs': épocas totales ejecutadas,
+            'stop_criterion': criterio de parada utilizado
         }
     """
+    if stop_criterion not in VALID_STOP_CRITERIA:
+        raise ValueError(f"Criterio de parada '{stop_criterion}' no válido. "
+                         f"Opciones: {VALID_STOP_CRITERIA}")
+    
     epoch_offset = 0
     global_start_time = time.perf_counter()
     
     reff_history = []  # R_eff al final de cada ciclo
     reff_means = []    # Medias de R_eff (a partir del ciclo CONVERGENCE_WINDOW)
+    pde_residuals = [] # Historial de residuos PDE (para pde-residual)
     
     converged = False
     cycle = 0
@@ -470,7 +590,13 @@ def train_until_convergence(model: PINN, p: int, device: torch.device,
     exacts = effective_exact_all()
     reff_exact = exacts[p - 1]
     
-    print(f"    {DIM}Iniciando entrenamiento con convergencia adaptativa (tol={tolerance}%){RESET}")
+    criterion_label = {
+        'simple': f'simple (tol={tolerance}%)',
+        'pde-residual': f'pde-residual (tol={DEFAULT_PDE_RESIDUAL_TOL:.1e})',
+        'cv': f'cv (tol={DEFAULT_CV_TOL}, ventana={CV_WINDOW})',
+    }[stop_criterion]
+    
+    print(f"    {DIM}Criterio de parada: {criterion_label}{RESET}")
     
     while cycle < max_cycles and not converged:
         # Ejecutar un ciclo
@@ -487,35 +613,66 @@ def train_until_convergence(model: PINN, p: int, device: torch.device,
         rel_err = rel_errs[p - 1]
         reff_history.append(reff_pred)
         
-        # Calcular media a partir del ciclo CONVERGENCE_WINDOW
-        if cycle >= CONVERGENCE_WINDOW:
-            current_mean = sum(reff_history[-CONVERGENCE_WINDOW:]) / CONVERGENCE_WINDOW
-            reff_means.append(current_mean)
+        # ------------------------------------------------------------------
+        # Criterio: simple (original)
+        # ------------------------------------------------------------------
+        if stop_criterion == 'simple':
+            if cycle >= CONVERGENCE_WINDOW:
+                current_mean = sum(reff_history[-CONVERGENCE_WINDOW:]) / CONVERGENCE_WINDOW
+                reff_means.append(current_mean)
+                
+                print(f"    {ICO_CYCLE} Ciclo {cycle}: R_eff={reff_pred:.6f}, "
+                      f"media({CONVERGENCE_WINDOW})={current_mean:.6f}, err_rel={rel_err:.4f}%")
+                
+                if cycle >= MIN_CYCLES_BEFORE_CHECK and len(reff_means) >= CONVERGENCE_WINDOW:
+                    mean_old = reff_means[-CONVERGENCE_WINDOW]
+                    mean_new = reff_means[-1]
+                    
+                    if abs(reff_exact) > 1e-12:
+                        diff_pct = abs(mean_new - mean_old) / abs(reff_exact) * 100.0
+                    else:
+                        diff_pct = abs(mean_new - mean_old) * 100.0
+                    
+                    print(f"    {DIM}Δmedia = |{mean_new:.6f} - {mean_old:.6f}| = {diff_pct:.6f}% (tol={tolerance}%){RESET}")
+                    
+                    if diff_pct < tolerance:
+                        converged = True
+                        print(f"    {ICO_STOP} Convergencia alcanzada en ciclo {cycle}")
+            else:
+                print(f"    {ICO_CYCLE} Ciclo {cycle}: R_eff={reff_pred:.6f}, err_rel={rel_err:.4f}%")
+        
+        # ------------------------------------------------------------------
+        # Criterio: pde-residual
+        # ------------------------------------------------------------------
+        elif stop_criterion == 'pde-residual':
+            pde_res = compute_pde_residual_on_validation(model, device)
+            pde_residuals.append(pde_res)
             
-            # Log de progreso
             print(f"    {ICO_CYCLE} Ciclo {cycle}: R_eff={reff_pred:.6f}, "
-                  f"media({CONVERGENCE_WINDOW})={current_mean:.6f}, err_rel={rel_err:.4f}%")
+                  f"err_rel={rel_err:.4f}%, residuo_PDE={pde_res:.4e}")
             
-            # Evaluar convergencia a partir del ciclo MIN_CYCLES_BEFORE_CHECK
-            if cycle >= MIN_CYCLES_BEFORE_CHECK and len(reff_means) >= CONVERGENCE_WINDOW:
-                # Comparar media actual con media de hace CONVERGENCE_WINDOW ciclos
-                mean_old = reff_means[-CONVERGENCE_WINDOW]
-                mean_new = reff_means[-1]
-                
-                # Calcular diferencia relativa respecto al valor exacto
-                if abs(reff_exact) > 1e-12:
-                    diff_pct = abs(mean_new - mean_old) / abs(reff_exact) * 100.0
-                else:
-                    diff_pct = abs(mean_new - mean_old) * 100.0
-                
-                print(f"    {DIM}Δmedia = |{mean_new:.6f} - {mean_old:.6f}| = {diff_pct:.6f}% (tol={tolerance}%){RESET}")
-                
-                if diff_pct < tolerance:
+            if cycle >= MIN_CYCLES_BEFORE_CHECK:
+                if pde_res < DEFAULT_PDE_RESIDUAL_TOL:
                     converged = True
-                    print(f"    {ICO_STOP} Convergencia alcanzada en ciclo {cycle}")
-        else:
-            # Log básico para ciclos iniciales
-            print(f"    {ICO_CYCLE} Ciclo {cycle}: R_eff={reff_pred:.6f}, err_rel={rel_err:.4f}%")
+                    print(f"    {ICO_STOP} Convergencia PDE alcanzada en ciclo {cycle} "
+                          f"(residuo={pde_res:.4e} < {DEFAULT_PDE_RESIDUAL_TOL:.1e})")
+        
+        # ------------------------------------------------------------------
+        # Criterio: cv (coeficiente de variación)
+        # ------------------------------------------------------------------
+        elif stop_criterion == 'cv':
+            if cycle >= CV_WINDOW:
+                cv_val = compute_cv(reff_history[-CV_WINDOW:])
+                
+                print(f"    {ICO_CYCLE} Ciclo {cycle}: R_eff={reff_pred:.6f}, "
+                      f"err_rel={rel_err:.4f}%, CV({CV_WINDOW})={cv_val:.6e}")
+                
+                if cycle >= MIN_CYCLES_BEFORE_CHECK and cv_val < DEFAULT_CV_TOL:
+                    converged = True
+                    print(f"    {ICO_STOP} Convergencia CV alcanzada en ciclo {cycle} "
+                          f"(CV={cv_val:.6e} < {DEFAULT_CV_TOL})")
+            else:
+                print(f"    {ICO_CYCLE} Ciclo {cycle}: R_eff={reff_pred:.6f}, err_rel={rel_err:.4f}%")
     
     if not converged:
         print(f"    {YELLOW}Máximo de ciclos ({max_cycles}) alcanzado sin convergencia{RESET}")
@@ -537,7 +694,8 @@ def train_until_convergence(model: PINN, p: int, device: torch.device,
         'reff_history': reff_history,
         'reff_exact': reff_exact,
         'final_rel_err': final_rel_err,
-        'total_epochs': epoch_offset
+        'total_epochs': epoch_offset,
+        'stop_criterion': stop_criterion,
     }
 
 
@@ -771,7 +929,8 @@ def generate_plots(p_run: int, loss_csv: str, relerr_csv: str, cycles: int = 1):
 # Entrenamiento de un problema
 # ==============================================================================
 def train_problem(p: int, device: torch.device, tolerance: float = DEFAULT_CONVERGENCE_TOLERANCE,
-                  max_cycles: int = 100, force_retrain: bool = False, quiet: bool = False) -> Dict[str, Any]:
+                  max_cycles: int = 100, force_retrain: bool = False, quiet: bool = False,
+                  stop_criterion: str = DEFAULT_STOP_CRITERION) -> Dict[str, Any]:
     """
     Entrena un problema específico con criterio de parada adaptativo.
     
@@ -782,6 +941,7 @@ def train_problem(p: int, device: torch.device, tolerance: float = DEFAULT_CONVE
         max_cycles: Número máximo de ciclos (default 100)
         force_retrain: Forzar reentrenamiento aunque exista modelo
         quiet: Si True, suprime mensajes de iteración de Adam y LBFGS
+        stop_criterion: Criterio de parada: 'simple', 'pde-residual' o 'cv'
     
     Returns:
         Dict con resultados del entrenamiento
@@ -790,7 +950,7 @@ def train_problem(p: int, device: torch.device, tolerance: float = DEFAULT_CONVE
     print(f"    Configuración: Adam={EPOCH_ADAMS} + {EPOCH_ADAMS_FOLLOWING_CYCLES}/ciclo, "
           f"LBFGS={EPOCH_LBFGS} + {EPOCH_LBFGS_FOLLOWING_CYCLES}/ciclo")
     print(f"    LR={ADAM_LR:.1e}, Arquitectura: {LAYERS}")
-    print(f"    Criterio de parada: tolerancia={tolerance}%, max_ciclos={max_cycles}")
+    print(f"    Criterio de parada: {stop_criterion}, tolerancia={tolerance}%, max_ciclos={max_cycles}")
     
     # Verificar si existe un modelo guardado
     model_path = format_filename(p, 'model', ext='.pt')
@@ -851,7 +1011,8 @@ def train_problem(p: int, device: torch.device, tolerance: float = DEFAULT_CONVE
         callback_every=10,
         tolerance=tolerance,
         max_cycles=max_cycles,
-        quiet=quiet
+        quiet=quiet,
+        stop_criterion=stop_criterion
     )
     training_time = time.perf_counter() - start_time
     
@@ -975,7 +1136,8 @@ def compute_statistics(values: List[float], truncate_pct: float = DEFAULT_TRUNCA
 
 def run_single_iteration(iteration: int, seed: int, targets: List[int], 
                          tolerance: float, max_cycles: int, 
-                         base_results_dir: str, quiet: bool = False) -> Dict[str, Any]:
+                         base_results_dir: str, quiet: bool = False,
+                         stop_criterion: str = DEFAULT_STOP_CRITERION) -> Dict[str, Any]:
     """
     Ejecuta una iteración completa de entrenamiento con un seed específico.
     
@@ -987,6 +1149,7 @@ def run_single_iteration(iteration: int, seed: int, targets: List[int],
         max_cycles: Máximo de ciclos
         base_results_dir: Directorio base para resultados de esta iteración
         quiet: Si True, suprime mensajes de iteración de Adam y LBFGS
+        stop_criterion: Criterio de parada: 'simple', 'pde-residual' o 'cv'
     
     Returns:
         Dict con resultados de todos los problemas y términos cruzados
@@ -1012,7 +1175,8 @@ def run_single_iteration(iteration: int, seed: int, targets: List[int],
     # Entrenar cada problema
     for p in sorted(targets):
         result = train_problem(p, device, tolerance=tolerance, 
-                               max_cycles=max_cycles, force_retrain=True, quiet=quiet)  # Siempre forzar en multi-run
+                               max_cycles=max_cycles, force_retrain=True, quiet=quiet,
+                               stop_criterion=stop_criterion)  # Siempre forzar en multi-run
         results.append(result)
     
     # Recopilar modelos y Reff
@@ -1052,7 +1216,8 @@ def run_single_iteration(iteration: int, seed: int, targets: List[int],
 
 def run_multi_seed_analysis(n_runs: int, targets: List[int], tolerance: float,
                             max_cycles: int, base_seed: int = TRAIN_SEED,
-                            quiet: bool = False, truncate_pct: float = DEFAULT_TRUNCATE_PCT) -> Dict[str, Any]:
+                            quiet: bool = False, truncate_pct: float = DEFAULT_TRUNCATE_PCT,
+                            stop_criterion: str = DEFAULT_STOP_CRITERION) -> Dict[str, Any]:
     """
     Ejecuta N iteraciones del entrenamiento completo con diferentes seeds.
     
@@ -1064,6 +1229,7 @@ def run_multi_seed_analysis(n_runs: int, targets: List[int], tolerance: float,
         base_seed: Seed base para generar los n_runs seeds
         quiet: Si True, suprime mensajes de iteración de Adam y LBFGS
         truncate_pct: Porcentaje de valores a quitar por cada lado para media truncada
+        stop_criterion: Criterio de parada: 'simple', 'pde-residual' o 'cv'
     
     Returns:
         Dict con todos los resultados y estadísticas consolidadas
@@ -1079,6 +1245,7 @@ def run_multi_seed_analysis(n_runs: int, targets: List[int], tolerance: float,
     print(f"{BOLD}{MAGENTA}{'='*90}{RESET}")
     print(f"Problemas a entrenar: {targets}")
     print(f"Tolerancia de convergencia: {tolerance}%")
+    print(f"Criterio de parada: {stop_criterion}")
     print(f"Máximo de ciclos: {max_cycles}")
     print(f"Directorio base: {base_results_dir}")
     
@@ -1092,7 +1259,8 @@ def run_multi_seed_analysis(n_runs: int, targets: List[int], tolerance: float,
     
     # Ejecutar cada iteración
     for i, seed in enumerate(seeds, start=1):
-        run_result = run_single_iteration(i, seed, targets, tolerance, max_cycles, base_results_dir, quiet)
+        run_result = run_single_iteration(i, seed, targets, tolerance, max_cycles, base_results_dir, quiet,
+                                             stop_criterion=stop_criterion)
         all_runs.append(run_result)
     
     total_time = time.perf_counter() - global_start
@@ -1357,6 +1525,12 @@ def main():
                         help='Silencia los mensajes de iteración de Adam/LBFGS dentro de los ciclos')
     parser.add_argument('--truncate-pct', type=float, default=DEFAULT_TRUNCATE_PCT,
                         help=f'Porcentaje de valores a eliminar por cada lado para media truncada (default: {DEFAULT_TRUNCATE_PCT}%%)')
+    parser.add_argument('--stop', type=str, default=DEFAULT_STOP_CRITERION,
+                        choices=VALID_STOP_CRITERIA,
+                        help=f'Criterio de parada: simple (media móvil R_eff), '
+                             f'pde-residual (residuo PDE en validación), '
+                             f'cv (coeficiente de variación de R_eff) '
+                             f'(default: {DEFAULT_STOP_CRITERION})')
     args = parser.parse_args()
     
     # Determinar problemas a entrenar
@@ -1374,7 +1548,8 @@ def main():
             max_cycles=args.max_cycles,
             base_seed=args.base_seed,
             quiet=args.quiet_iterations,
-            truncate_pct=args.truncate_pct
+            truncate_pct=args.truncate_pct,
+            stop_criterion=args.stop
         )
         return
     
@@ -1395,6 +1570,7 @@ def main():
     print(f"  N_COLLOCATION: {N_COLLOCATION}")
     
     print(f"\n{BOLD}Criterio de parada:{RESET}")
+    print(f"  Criterio: {args.stop}")
     print(f"  Tolerancia de convergencia: {args.tolerance}%")
     print(f"  Mínimo ciclos antes de evaluar: {MIN_CYCLES_BEFORE_CHECK}")
     print(f"  Ventana de comparación: {CONVERGENCE_WINDOW} ciclos")
@@ -1409,7 +1585,7 @@ def main():
     for p in sorted(targets):
         result = train_problem(p, device, tolerance=args.tolerance, 
                                max_cycles=args.max_cycles, force_retrain=args.force_retrain,
-                               quiet=args.quiet_iterations)
+                               quiet=args.quiet_iterations, stop_criterion=args.stop)
         results.append(result)
     
     total_time = time.perf_counter() - global_start
