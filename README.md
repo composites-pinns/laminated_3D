@@ -2,6 +2,12 @@
 
 Training Physics-Informed Neural Networks (PINNs) to compute effective elastic properties in elastic laminated composites.
 
+This repository contains the code accompanying the following published article.
+
+> C. Quesada-González, O. L. Cruz-González, R. Rodríguez-Ramos, B. Mederos, Y. Espinosa-Almeyda, and J. Merodio (2026).\
+> Multi-scale modelling of composite materials: a hybrid approach integrating asymptotic homogenization and physics-informed neural networks.\
+> *Proceedings of the Royal Society A*, 482(2350), article 20260542. Published online 18 November 2026. [DOI 10.1098/rspa.2026.0542](https://doi.org/10.1098/rspa.2026.0542).
+
 ## Project Structure
 
 ```
